@@ -1,0 +1,10 @@
+[Unit]
+Description=Multicast DNS proxy
+After=network-online.target
+
+[Service]
+ExecStart=/home/mdnsproxy/proxy -user mdnsproxy -chroot /home/mdnsproxy/chroot -timeout 10
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
