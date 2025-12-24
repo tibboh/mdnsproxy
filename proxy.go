@@ -26,23 +26,22 @@ var (
 
 type Options struct {
 	listenAddr    string
-	multicastAddr net.UDPAddr
-	upstreamAddr  []net.UDPAddr
+	multicastAddr string
+	upstreamAddrs []string
 	timeout       time.Duration
-	afterSetup    func() error
 }
 
 func FromFlags() Options {
 	flag.Parse()
 	var o Options
 	o.listenAddr = *listenFlag
-	o.multicastAddr = net.UDPAddr{
-		IP:   net.ParseIP("224.0.0.251"),
-		Port: 5353,
-	}
+	o.multicastAddr = "224.0.0.251:5353"
 	for _, up := range strings.Split(*upstreamFlag, ",") {
-		addr := net.UDPAddr{IP: net.ParseIP(up), Port: 53}
-		o.upstreamAddr = append(o.upstreamAddr, addr)
+		ip := net.ParseIP(strings.TrimSpace(up))
+		if ip == nil {
+			log.Fatalf("Invalid upstream IP address: %s", up)
+		}
+		o.upstreamAddrs = append(o.upstreamAddrs, net.JoinHostPort(ip.String(), "53"))
 	}
 	o.timeout = time.Duration(*timeoutFlag) * time.Second
 	return o
@@ -50,38 +49,18 @@ func FromFlags() Options {
 
 type Server struct {
 	options     Options
-	server      dns.Server
+	server      *dns.Server
+	client      *dns.Client
 	localBlocks []*net.IPNet
 	errc        chan error
 }
 
-func (s Server) fetchResponse(q *dns.Msg, addr *net.UDPAddr) (r *dns.Msg, err error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	defer conn.Close()
-	if err != nil {
-		return nil, fmt.Errorf("listen failed: %w", err)
-	}
-	conn.SetDeadline(time.Now().Add(s.options.timeout))
-	buf, err := q.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("could not generate query: %w", err)
-	}
-	if _, err = conn.WriteToUDP(buf, addr); err != nil {
-		return nil, fmt.Errorf("could not send query: %w", err)
-	}
-	buf = make([]byte, 65536)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, fmt.Errorf("could not read response: %w", err)
-	}
-	msg := new(dns.Msg)
-	if err := msg.Unpack(buf[:n]); err != nil {
-		return nil, fmt.Errorf("could not parse response: %w", err)
-	}
-	return msg, nil
+func (s *Server) fetchResponse(q *dns.Msg, addr string) (*dns.Msg, error) {
+	r, _, err := s.client.Exchange(q, addr)
+	return r, err
 }
 
-func (s Server) IsLocal(q *dns.Msg) bool {
+func (s *Server) IsLocal(q *dns.Msg) bool {
 	name := q.Question[0].Name
 	if dns.IsSubDomain("local.", name) {
 		return true
@@ -108,7 +87,7 @@ func (s Server) IsLocal(q *dns.Msg) bool {
 	return false
 }
 
-func (s Server) handleSelf(q *dns.Msg) (r *dns.Msg, err error) {
+func (s *Server) handleSelf(q *dns.Msg) (*dns.Msg, error) {
 	response := new(dns.Msg)
 	response.SetRcode(q, dns.RcodeNameError)
 	return response, nil
@@ -117,7 +96,7 @@ func (s Server) handleSelf(q *dns.Msg) (r *dns.Msg, err error) {
 func (s Server) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
 	q.RecursionDesired = false
 	q.Question[0].Qclass |= 1 << 15
-	r, err = s.fetchResponse(q, &s.options.multicastAddr)
+	r, err = s.fetchResponse(q, s.options.multicastAddr)
 	if err != nil {
 		return
 	}
@@ -130,9 +109,9 @@ func (s Server) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
 	return
 }
 
-func (s Server) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
-	for _, addr := range s.options.upstreamAddr {
-		r, err = s.fetchResponse(q, &addr)
+func (s *Server) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
+	for _, addr := range s.options.upstreamAddrs {
+		r, err = s.fetchResponse(q, addr)
 		if r != nil {
 			return
 		}
@@ -140,7 +119,7 @@ func (s Server) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
 	return
 }
 
-func (s Server) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
+func (s *Server) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
 	start := time.Now()
 	if len(q.Question) != 1 {
 		log.Printf("Invalid query")
@@ -171,7 +150,7 @@ func (s Server) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
 	log.Printf("%s %s %d OK", logstr, mode, time.Since(start).Milliseconds())
 }
 
-func ServerFromOptions(o Options) Server {
+func ServerFromOptions(o Options) *Server {
 	var localBlocks []*net.IPNet
 	for _, cidr := range []string{
 		"10.0.0.0/8",
@@ -185,14 +164,27 @@ func ServerFromOptions(o Options) Server {
 		}
 		localBlocks = append(localBlocks, block)
 	}
-	s := Server{o, dns.Server{Addr: o.listenAddr, Net: "udp"}, localBlocks, make(chan error, 1)}
-	dns.HandleFunc(".", func(w dns.ResponseWriter, q *dns.Msg) {
-		s.handleQuery(w, q)
-	})
+	s := &Server{
+		options:     o,
+		localBlocks: localBlocks,
+		errc:        make(chan error, 1),
+		client: &dns.Client{
+			Timeout: o.timeout,
+			Net:     "udp",
+		},
+	}
+	mux := dns.NewServeMux()
+	mux.HandleFunc(".", s.handleQuery)
+	s.server = &dns.Server{
+		Addr:              o.listenAddr,
+		Net:               "udp",
+		Handler:           mux,
+		NotifyStartedFunc: ServerStarted,
+	}
 	return s
 }
 
-func (s Server) ServeInternal() error {
+func (s *Server) ServeInternal() error {
 	if err := s.server.ListenAndServe(); err != nil {
 		s.errc <- err
 		return err
@@ -200,15 +192,10 @@ func (s Server) ServeInternal() error {
 	return nil // not reached
 }
 
-func (s Server) Serve() error {
+func (s *Server) Serve() error {
 	sigc := make(chan os.Signal)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go s.ServeInternal()
-	if s.options.afterSetup != nil {
-		if err := s.options.afterSetup(); err != nil {
-			return fmt.Errorf("after-setup hook failed: %w", err)
-		}
-	}
 	select {
 	case e := <-s.errc:
 		return e
@@ -256,9 +243,14 @@ func DropPrivileges() error {
 	return nil
 }
 
+func ServerStarted() {
+	if err := DropPrivileges(); err != nil {
+		log.Fatalf("could not drop privileges: %v", err)
+	}
+}
+
 func main() {
 	options := FromFlags()
-	options.afterSetup = DropPrivileges
 	server := ServerFromOptions(options)
 	if err := server.Serve(); err != nil {
 		log.Fatalf("Error starting server: %v", err)
