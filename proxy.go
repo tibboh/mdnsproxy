@@ -22,12 +22,13 @@ var (
 	timeoutFlag  = flag.Int("timeout", 1, "Timeout for DNS queries (seconds)")
 	userFlag     = flag.String("user", "nobody", "User to run as after dropping root")
 	chrootFlag   = flag.String("chroot", "", "Directory to chroot to")
+	tsFlag       = flag.Bool("timestamp", false, "Add timestamp to log entries")
 )
 
 type Options struct {
 	listenAddr    string
-	multicastAddr string
-	upstreamAddrs []string
+	multicastAddr net.UDPAddr
+	upstreamAddrs []net.UDPAddr
 	timeout       time.Duration
 }
 
@@ -35,13 +36,13 @@ func FromFlags() Options {
 	flag.Parse()
 	var o Options
 	o.listenAddr = *listenFlag
-	o.multicastAddr = "224.0.0.251:5353"
+	o.multicastAddr = net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353}
 	for _, up := range strings.Split(*upstreamFlag, ",") {
 		ip := net.ParseIP(strings.TrimSpace(up))
 		if ip == nil {
 			log.Fatalf("Invalid upstream IP address: %s", up)
 		}
-		o.upstreamAddrs = append(o.upstreamAddrs, net.JoinHostPort(ip.String(), "53"))
+		o.upstreamAddrs = append(o.upstreamAddrs, net.UDPAddr{IP: ip, Port: 53})
 	}
 	o.timeout = time.Duration(*timeoutFlag) * time.Second
 	return o
@@ -50,14 +51,34 @@ func FromFlags() Options {
 type Server struct {
 	options     Options
 	server      *dns.Server
-	client      *dns.Client
 	localBlocks []*net.IPNet
 	errc        chan error
 }
 
-func (s *Server) fetchResponse(q *dns.Msg, addr string) (*dns.Msg, error) {
-	r, _, err := s.client.Exchange(q, addr)
-	return r, err
+func (s *Server) fetchResponse(q *dns.Msg, addr *net.UDPAddr) (*dns.Msg, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	defer conn.Close()
+	if err != nil {
+		return nil, fmt.Errorf("listen failed: %w", err)
+	}
+	conn.SetDeadline(time.Now().Add(s.options.timeout))
+	buf, err := q.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("could not generate query: %w", err)
+	}
+	if _, err = conn.WriteToUDP(buf, addr); err != nil {
+		return nil, fmt.Errorf("could not send query: %w", err)
+	}
+	buf = make([]byte, 65536)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("could not read response: %w", err)
+	}
+	msg := new(dns.Msg)
+	if err := msg.Unpack(buf[:n]); err != nil {
+		return nil, fmt.Errorf("could not parse response: %w", err)
+	}
+	return msg, nil
 }
 
 func (s *Server) IsLocal(q *dns.Msg) bool {
@@ -96,7 +117,7 @@ func (s *Server) handleSelf(q *dns.Msg) (*dns.Msg, error) {
 func (s Server) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
 	q.RecursionDesired = false
 	q.Question[0].Qclass |= 1 << 15
-	r, err = s.fetchResponse(q, s.options.multicastAddr)
+	r, err = s.fetchResponse(q, &s.options.multicastAddr)
 	if err != nil {
 		return
 	}
@@ -111,7 +132,7 @@ func (s Server) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
 
 func (s *Server) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
 	for _, addr := range s.options.upstreamAddrs {
-		r, err = s.fetchResponse(q, addr)
+		r, err = s.fetchResponse(q, &addr)
 		if r != nil {
 			return
 		}
@@ -168,10 +189,6 @@ func ServerFromOptions(o Options) *Server {
 		options:     o,
 		localBlocks: localBlocks,
 		errc:        make(chan error, 1),
-		client: &dns.Client{
-			Timeout: o.timeout,
-			Net:     "udp",
-		},
 	}
 	mux := dns.NewServeMux()
 	mux.HandleFunc(".", s.handleQuery)
@@ -250,6 +267,9 @@ func ServerStarted() {
 }
 
 func main() {
+	if !*tsFlag {
+		log.SetFlags(log.Flags() & ^(log.Ldate | log.Ltime))
+	}
 	options := FromFlags()
 	server := ServerFromOptions(options)
 	if err := server.Serve(); err != nil {
