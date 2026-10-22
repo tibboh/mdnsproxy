@@ -33,7 +33,6 @@ type Options struct {
 }
 
 func FromFlags() Options {
-	flag.Parse()
 	var o Options
 	o.listenAddr = *listenFlag
 	o.multicastAddr = net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353}
@@ -210,7 +209,7 @@ func (s *Server) ServeInternal() error {
 }
 
 func (s *Server) Serve() error {
-	sigc := make(chan os.Signal)
+	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
 	go s.ServeInternal()
 	select {
@@ -251,6 +250,9 @@ func DropPrivileges() error {
 	if err != nil {
 		return fmt.Errorf("could not parse GID %s: %w", u.Gid, err)
 	}
+	if err = syscall.Setgroups([]int{gid}); err != nil {
+		return fmt.Errorf("could not set supplementary groups: %w", err)
+	}
 	if err = syscall.Setgid(gid); err != nil {
 		return fmt.Errorf("could not set GID %d: %w", gid, err)
 	}
@@ -267,6 +269,7 @@ func ServerStarted() {
 }
 
 func main() {
+	flag.Parse()
 	if !*tsFlag {
 		log.SetFlags(log.Flags() & ^(log.Ldate | log.Ltime))
 	}
