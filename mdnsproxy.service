@@ -4,7 +4,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/mdnsproxy -user mdnsproxy -chroot /home/mdnsproxy/chroot -timeout 10
+ExecStart=/usr/local/bin/mdnsproxy -user mdnsproxy -chroot /home/mdnsproxy/chroot -timeout 10s
 Restart=on-failure
 
 [Install]

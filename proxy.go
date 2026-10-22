@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -19,48 +20,52 @@ import (
 var (
 	listenFlag   = flag.String("listen", "0.0.0.0:53", "Address to listen on")
 	upstreamFlag = flag.String("upstream", "8.8.8.8", "Comma-separated addresses of upstream DNS servers")
-	timeoutFlag  = flag.Int("timeout", 1, "Timeout for DNS queries (seconds)")
+	timeoutFlag  = flag.Duration("timeout", time.Second, "Timeout for DNS queries")
 	userFlag     = flag.String("user", "nobody", "User to run as after dropping root")
 	chrootFlag   = flag.String("chroot", "", "Directory to chroot to")
 	tsFlag       = flag.Bool("timestamp", false, "Add timestamp to log entries")
 )
 
-type Options struct {
+type config struct {
 	listenAddr    string
 	multicastAddr net.UDPAddr
 	upstreamAddrs []net.UDPAddr
 	timeout       time.Duration
+	user          string
+	chroot        string
 }
 
-func FromFlags() Options {
-	var o Options
-	o.listenAddr = *listenFlag
-	o.multicastAddr = net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353}
+func configFromFlags() config {
+	var c config
+	c.listenAddr = *listenFlag
+	c.multicastAddr = net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353}
 	for _, up := range strings.Split(*upstreamFlag, ",") {
 		ip := net.ParseIP(strings.TrimSpace(up))
 		if ip == nil {
 			log.Fatalf("Invalid upstream IP address: %s", up)
 		}
-		o.upstreamAddrs = append(o.upstreamAddrs, net.UDPAddr{IP: ip, Port: 53})
+		c.upstreamAddrs = append(c.upstreamAddrs, net.UDPAddr{IP: ip, Port: 53})
 	}
-	o.timeout = time.Duration(*timeoutFlag) * time.Second
-	return o
+	c.timeout = *timeoutFlag
+	c.user = *userFlag
+	c.chroot = *chrootFlag
+	return c
 }
 
-type Server struct {
-	options     Options
+type proxy struct {
+	cfg         config
 	server      *dns.Server
 	localBlocks []*net.IPNet
 	errc        chan error
 }
 
-func (s *Server) fetchResponse(q *dns.Msg, addr *net.UDPAddr) (*dns.Msg, error) {
+func (p *proxy) fetchResponse(q *dns.Msg, addr *net.UDPAddr) (*dns.Msg, error) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	defer conn.Close()
 	if err != nil {
 		return nil, fmt.Errorf("listen failed: %w", err)
 	}
-	conn.SetDeadline(time.Now().Add(s.options.timeout))
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(p.cfg.timeout))
 	buf, err := q.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("could not generate query: %w", err)
@@ -69,18 +74,33 @@ func (s *Server) fetchResponse(q *dns.Msg, addr *net.UDPAddr) (*dns.Msg, error) 
 		return nil, fmt.Errorf("could not send query: %w", err)
 	}
 	buf = make([]byte, 65536)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, fmt.Errorf("could not read response: %w", err)
+	// Skip packets that can't be the answer: a wrong ID, or for unicast queries a wrong sender.
+	// mDNS responders answer from their own address, so any sender is accepted for multicast.
+	var parseErr error
+	for {
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			return nil, fmt.Errorf("could not read response: %w", err)
+		}
+		if !addr.IP.IsMulticast() && !(from.IP.Equal(addr.IP) && from.Port == addr.Port) {
+			continue
+		}
+		msg := new(dns.Msg)
+		if err := msg.Unpack(buf[:n]); err != nil {
+			parseErr = fmt.Errorf("could not parse response: %w", err)
+			continue
+		}
+		if msg.Id != q.Id {
+			continue
+		}
+		return msg, nil
 	}
-	msg := new(dns.Msg)
-	if err := msg.Unpack(buf[:n]); err != nil {
-		return nil, fmt.Errorf("could not parse response: %w", err)
-	}
-	return msg, nil
 }
 
-func (s *Server) IsLocal(q *dns.Msg) bool {
+func (p *proxy) isLocal(q *dns.Msg) bool {
 	name := q.Question[0].Name
 	if dns.IsSubDomain("local.", name) {
 		return true
@@ -99,7 +119,7 @@ func (s *Server) IsLocal(q *dns.Msg) bool {
 	if ip == nil {
 		return false
 	}
-	for _, block := range s.localBlocks {
+	for _, block := range p.localBlocks {
 		if block.Contains(ip) {
 			return true
 		}
@@ -107,16 +127,16 @@ func (s *Server) IsLocal(q *dns.Msg) bool {
 	return false
 }
 
-func (s *Server) handleSelf(q *dns.Msg) (*dns.Msg, error) {
+func (p *proxy) handleSelf(q *dns.Msg) (*dns.Msg, error) {
 	response := new(dns.Msg)
 	response.SetRcode(q, dns.RcodeNameError)
 	return response, nil
 }
 
-func (s Server) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
+func (p *proxy) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
 	q.RecursionDesired = false
 	q.Question[0].Qclass |= 1 << 15
-	r, err = s.fetchResponse(q, &s.options.multicastAddr)
+	r, err = p.fetchResponse(q, &p.cfg.multicastAddr)
 	if err != nil {
 		return
 	}
@@ -129,9 +149,9 @@ func (s Server) handleLocal(q *dns.Msg) (r *dns.Msg, err error) {
 	return
 }
 
-func (s *Server) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
-	for _, addr := range s.options.upstreamAddrs {
-		r, err = s.fetchResponse(q, &addr)
+func (p *proxy) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
+	for _, addr := range p.cfg.upstreamAddrs {
+		r, err = p.fetchResponse(q, &addr)
 		if r != nil {
 			return
 		}
@@ -139,7 +159,7 @@ func (s *Server) handleUpstream(q *dns.Msg) (r *dns.Msg, err error) {
 	return
 }
 
-func (s *Server) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
+func (p *proxy) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
 	start := time.Now()
 	if len(q.Question) != 1 {
 		log.Printf("Invalid query")
@@ -150,13 +170,13 @@ func (s *Server) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
 	var response *dns.Msg
 	var err error
 	if q.Question[0].Name == "local." { // or reverse lookup for our own ip address!
-		response, err = s.handleSelf(q)
+		response, err = p.handleSelf(q)
 		mode = "self"
-	} else if s.IsLocal(q) {
-		response, err = s.handleLocal(q)
+	} else if p.isLocal(q) {
+		response, err = p.handleLocal(q)
 		mode = "local"
 	} else {
-		response, err = s.handleUpstream(q)
+		response, err = p.handleUpstream(q)
 		mode = "upstream"
 	}
 	if response == nil {
@@ -170,7 +190,7 @@ func (s *Server) handleQuery(w dns.ResponseWriter, q *dns.Msg) {
 	log.Printf("%s %s %d OK", logstr, mode, time.Since(start).Milliseconds())
 }
 
-func ServerFromOptions(o Options) *Server {
+func newProxy(c config) *proxy {
 	var localBlocks []*net.IPNet
 	for _, cidr := range []string{
 		"10.0.0.0/8",
@@ -184,36 +204,36 @@ func ServerFromOptions(o Options) *Server {
 		}
 		localBlocks = append(localBlocks, block)
 	}
-	s := &Server{
-		options:     o,
+	p := &proxy{
+		cfg:         c,
 		localBlocks: localBlocks,
 		errc:        make(chan error, 1),
 	}
 	mux := dns.NewServeMux()
-	mux.HandleFunc(".", s.handleQuery)
-	s.server = &dns.Server{
-		Addr:              o.listenAddr,
+	mux.HandleFunc(".", p.handleQuery)
+	p.server = &dns.Server{
+		Addr:              c.listenAddr,
 		Net:               "udp",
 		Handler:           mux,
-		NotifyStartedFunc: ServerStarted,
+		NotifyStartedFunc: p.started,
 	}
-	return s
+	return p
 }
 
-func (s *Server) ServeInternal() error {
-	if err := s.server.ListenAndServe(); err != nil {
-		s.errc <- err
+func (p *proxy) serveInternal() error {
+	if err := p.server.ListenAndServe(); err != nil {
+		p.errc <- err
 		return err
 	}
 	return nil // not reached
 }
 
-func (s *Server) Serve() error {
+func (p *proxy) serve() error {
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
-	go s.ServeInternal()
+	go p.serveInternal()
 	select {
-	case e := <-s.errc:
+	case e := <-p.errc:
 		return e
 	case sig := <-sigc:
 		log.Printf("Terminating on signal (%s)", sig)
@@ -221,25 +241,27 @@ func (s *Server) Serve() error {
 	}
 }
 
-func DropPrivileges() error {
+func (p *proxy) dropPrivileges() error {
 	if syscall.Getuid() != 0 {
 		return nil
 	}
-	var u *user.User
-	if len(*userFlag) > 0 {
-		var err error
-		u, err = user.Lookup(*userFlag)
-		if err != nil {
-			return fmt.Errorf("could not look up user %s: %w", *userFlag, err)
-		}
+	if p.cfg.user == "" {
+		return errors.New("running as root, but no user to switch to was given")
 	}
-	dir := *chrootFlag
-	if dir == "" && u != nil {
+	u, err := user.Lookup(p.cfg.user)
+	if err != nil {
+		return fmt.Errorf("could not look up user %s: %w", p.cfg.user, err)
+	}
+	dir := p.cfg.chroot
+	if dir == "" {
 		dir = u.HomeDir
 	}
 	if dir != "" {
 		if err := syscall.Chroot(dir); err != nil {
 			return fmt.Errorf("could not change root dir to %s: %w", dir, err)
+		}
+		if err := syscall.Chdir("/"); err != nil {
+			return fmt.Errorf("could not change dir to new root: %w", err)
 		}
 	}
 	uid, err := strconv.Atoi(u.Uid)
@@ -262,8 +284,8 @@ func DropPrivileges() error {
 	return nil
 }
 
-func ServerStarted() {
-	if err := DropPrivileges(); err != nil {
+func (p *proxy) started() {
+	if err := p.dropPrivileges(); err != nil {
 		log.Fatalf("could not drop privileges: %v", err)
 	}
 }
@@ -273,9 +295,8 @@ func main() {
 	if !*tsFlag {
 		log.SetFlags(log.Flags() & ^(log.Ldate | log.Ltime))
 	}
-	options := FromFlags()
-	server := ServerFromOptions(options)
-	if err := server.Serve(); err != nil {
+	p := newProxy(configFromFlags())
+	if err := p.serve(); err != nil {
 		log.Fatalf("Error starting server: %v", err)
 	}
 }

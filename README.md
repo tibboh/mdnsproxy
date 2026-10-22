@@ -34,8 +34,8 @@ mdnsproxy accepts the following flags:
     	Directory to chroot to
   -listen string
     	Address to listen on (default "0.0.0.0:53")
-  -timeout int
-    	Timeout for DNS queries (seconds) (default 1)
+  -timeout duration
+    	Timeout for DNS queries (default 1s)
   -timestamp
     	Add timestamp to log entries
   -upstream string
@@ -76,7 +76,7 @@ settings (affects the whole network) or in each device's network settings.
 
 The included [unit file](mdnsproxy.service) can be used to start mdnsproxy automatically. It assumes a user `mdnsproxy`
 exists, the program binary is at `/usr/local/bin/mdnsproxy`, and it chroots to `/home/mdnsproxy/chroot`. It also sets
-`-timeout 10`, so an unanswered `.local` query takes 10 seconds to fail; lower it if your clients give up sooner.
+`-timeout 10s`, so an unanswered `.local` query takes 10 seconds to fail; lower it if your clients give up sooner.
 
 The binary is started as root, so it should not be writable by the `mdnsproxy` user. To set everything up:
 
